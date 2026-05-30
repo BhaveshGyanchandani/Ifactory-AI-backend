@@ -260,10 +260,10 @@ async def load_all_models() -> None:
     models["normalizer"]   = await asyncio.to_thread(joblib.load, paths["normalizer"])
 
     models["autoencoder"] = await asyncio.to_thread(
-        keras.models.load_model, str(paths["autoencoder"]), False
+        lambda: keras.models.load_model(_lstm_path, compile=False)
     )
     models["lstm"] = await asyncio.to_thread(
-        keras.models.load_model, str(paths["lstm_model"]), False
+        lambda: keras.models.load_model(_lstm_path, compile=False)
     )
 
     def _load_xgb() -> xgb.XGBClassifier:
