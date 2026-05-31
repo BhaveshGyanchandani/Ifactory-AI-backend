@@ -405,20 +405,36 @@ def run_inference(
             f"Need at least {SEQ_LEN + 1} rows after feature engineering, got {n}."
         )
 
-    ae_sc  = _ae_anomaly_score(X_sc)
-    if_sc  = -models["iforest"].decision_function(X_sc)
-    rf_p   = models["rf"].predict_proba(X_sc)[:, 1]
-    xgb_p  = models["xgb"].predict_proba(X_sc)[:, 1]
-    lstm_p = _lstm_batch_predict(X_sc)
+    ae_sc     = _ae_anomaly_score(X_sc)
+    if_sc     = -models["iforest"].decision_function(X_sc)
+    rf_proba  = models["rf"].predict_proba(X_sc)         # shape (n, 2)
+    xgb_proba = models["xgb"].predict_proba(X_sc)        # shape (n, 2)
+    rf_p      = rf_proba[:, 1]                            # class-1 for result DF
+    xgb_p     = xgb_proba[:, 1]                          # class-1 for result DF
+    lstm_p    = _lstm_batch_predict(X_sc)
 
     ae_n = _norm_ae(ae_sc)
     if_n = _norm_if(if_sc)
 
     off = SEQ_LEN
-    # 5-feature meta-stack: one score per base model (matches trained meta_learner.pkl)
-    M    = np.column_stack([
-        ae_n[off:], if_n[off:], rf_p[off:], xgb_p[off:], lstm_p[off:],
+    # 7-feature meta-stack matching trained meta_learner.pkl:
+    # [ae_n, if_n, rf_p0, rf_p1, xgb_p0, xgb_p1, lstm_p]
+    M = np.column_stack([
+        ae_n[off:],
+        if_n[off:],
+        rf_proba[off:, 0],
+        rf_proba[off:, 1],
+        xgb_proba[off:, 0],
+        xgb_proba[off:, 1],
+        lstm_p[off:],
     ])
+    # Guard: verify shape matches what meta_learner expects
+    expected_feats = int(getattr(models["meta_learner"], "n_features_in_", 7))
+    if M.shape[1] != expected_feats:
+        raise ValueError(
+            f"Meta-learner shape mismatch: expected {expected_feats} features, "
+            f"got {M.shape[1]}. Check the M column_stack in run_inference."
+        )
     risk  = models["meta_learner"].predict_proba(M)[:, 1]
     alarm = risk >= _threshold
 
