@@ -1196,23 +1196,32 @@ async def energy_analysis(body: EnergyAnalysisRequest):
 # ── 4. SIMULATION (WHAT-IF) ───────────────────────────────────────────────────
 @app.post("/simulate", tags=["simulation"])
 async def simulate(body: SimulationRequest):
-    """
-    Fabricate a synthetic 35-row window from a single set of sensor values,
-    run full inference, and return prediction, sensor status, and energy snapshot.
-    """
     _require_models()
     input_values = body.model_dump()
-    syn_df = _make_synthetic_window(input_values, n_rows=SEQ_LEN + 5)
+
+    # Run heavy inference off the event loop so WebSocket stays alive
+    def _run():
+        syn_df = _make_synthetic_window(input_values, n_rows=SEQ_LEN + 5)
+        return run_inference(syn_df), syn_df
 
     try:
-        result = run_inference(syn_df)
+        result, syn_df = await asyncio.to_thread(_run)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
     last = result.iloc[-1]
+
+    # Debug log — check Render logs after submitting to see actual values
+    logger.info(
+        "simulate → ae=%.4f if=%.4f rf=%.4f xgb=%.4f lstm=%.4f risk=%.4f alarm=%s",
+        float(last["autoencoder"]), float(last["isolation_forest"]),
+        float(last["random_forest"]), float(last["xgboost"]),
+        float(last["lstm"]), float(last["risk_score"]), bool(last["alarm"]),
+    )
+
     prediction = {
-        # "risk_score":       round(float(last["risk_score"]),       4),
-        # "alarm":            bool(last["alarm"]),
+        "risk_score":       round(float(last["risk_score"]),       4),
+        "alarm":            bool(last["alarm"]),
         "autoencoder":      round(float(last["autoencoder"]),      4),
         "isolation_forest": round(float(last["isolation_forest"]), 4),
         "random_forest":    round(float(last["random_forest"]),    4),
@@ -1221,7 +1230,6 @@ async def simulate(body: SimulationRequest):
     }
 
     sensor_status = [_sensor_status(s, input_values[s]) for s in SENSOR_COLS]
-
     energy = _compute_energy_metrics(syn_df)
     energy_snapshot = {
         "overall_efficiency_score":                 energy["overall_efficiency_score"],
@@ -1229,7 +1237,6 @@ async def simulate(body: SimulationRequest):
         "estimated_energy_saving_if_optimized_pct": round(max(0, 90 - energy["overall_efficiency_score"]) * 0.47, 2),
     }
 
-    # To-normalize suggestions
     to_normalize = []
     for ss in sensor_status:
         if ss["status"] in ("CRITICAL", "WARNING") and ss["direction"] != "within":
@@ -1242,15 +1249,13 @@ async def simulate(body: SimulationRequest):
             })
 
     return {
-        "simulation_mode": True,
-        "input_values":    {k: round(v, 4) for k, v in input_values.items()},
-        "prediction":      prediction,
-        "sensor_status":   sensor_status,
-        "energy_snapshot": energy_snapshot,
+        "simulation_mode":   True,
+        "input_values":      {k: round(v, 4) for k, v in input_values.items()},
+        "prediction":        prediction,
+        "sensor_status":     sensor_status,
+        "energy_snapshot":   energy_snapshot,
         "to_normalize_risk": to_normalize,
     }
-
-
 # ── 5. CSV BULK WITH OPTIMISATION ─────────────────────────────────────────────
 @app.post("/predict/csv/optimized", tags=["inference", "optimization"])
 async def predict_csv_optimized(
@@ -2247,7 +2252,7 @@ async def stream_test_data(websocket: WebSocket):
         await websocket.close()
         return
     
-    delay_seconds = 1.5
+    delay_seconds = 4
     try:
         for idx, row in enumerate(rows):
             # Check if client is still connected before sending
