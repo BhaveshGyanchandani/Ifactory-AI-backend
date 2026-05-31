@@ -2264,7 +2264,7 @@ async def stream_test_data(websocket: WebSocket):
         await websocket.close()
         return
     
-    delay_seconds = 4
+    delay_seconds = 2.5
     try:
         for idx, row in enumerate(rows):
             # Check if client is still connected before sending
