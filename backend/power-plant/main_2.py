@@ -1195,8 +1195,8 @@ async def simulate(body: SimulationRequest):
 
     last = result.iloc[-1]
     prediction = {
-        "risk_score":       round(float(last["risk_score"]),       4),
-        "alarm":            bool(last["alarm"]),
+        # "risk_score":       round(float(last["risk_score"]),       4),
+        # "alarm":            bool(last["alarm"]),
         "autoencoder":      round(float(last["autoencoder"]),      4),
         "isolation_forest": round(float(last["isolation_forest"]), 4),
         "random_forest":    round(float(last["random_forest"]),    4),
@@ -2266,6 +2266,7 @@ async def stream_test_data(websocket: WebSocket):
             await websocket.close()
         except Exception:
             pass
+        
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
