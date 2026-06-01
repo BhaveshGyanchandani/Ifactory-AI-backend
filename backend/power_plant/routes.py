@@ -1910,7 +1910,7 @@ async def compute_full_analysis(
 
     # Build enriched predictions (same logic as /predict/enriched)
     enriched_predictions = []
-    for i, row in result.iterrows():
+    for i, (_, row) in enumerate(result.iterrows()):
         rec = {
             "timestamp": str(row["timestamp"]) if "timestamp" in result.columns else None,
             "risk_score": round(float(row["risk_score"]), 4),
@@ -2154,8 +2154,8 @@ async def compute_full_analysis(
         opt_result = {
             "current_risk_score": round(current_risk, 4),
             "target_risk_score": 0.3,
-            "expected_risk_after_optimization": round(expected_risk, 4),
-            "optimization_feasible": expected_risk <= 0.33,
+            "expected_risk_after_optimization": round(float(expected_risk), 4),
+            "optimization_feasible": bool(expected_risk <= 0.33),
             "sensor_recommendations": recs,
             "top_levers": [r["sensor"] for r in recs[:3]],
             "estimated_lead_time_gain_minutes": int(risk_gap / 0.01) if risk_gap > 0 else 0,
@@ -2207,7 +2207,6 @@ CSV_PATH = os.getenv("TEST_CSV_PATH", str(PROJECT_ROOT / "Data" / "boiler_testin
 
 @router.websocket("/ws/stream")
 async def stream_test_data(websocket: WebSocket):
-
     await websocket.accept()
 
     async def _handle_incoming():
@@ -2221,22 +2220,10 @@ async def stream_test_data(websocket: WebSocket):
     asyncio.create_task(_handle_incoming())
 
     if not Path(CSV_PATH).exists():
-        await websocket.send_json(
-            {"error": f"CSV file not found at {CSV_PATH}"}
-        )
-        await websocket.close()
-        return
-
-    # rest of your existing code... 
-
-async def stream_test_data(websocket: WebSocket):
-    await websocket.accept()
-    
-    if not Path(CSV_PATH).exists():
         await websocket.send_json({"error": f"CSV file not found at {CSV_PATH}"})
         await websocket.close()
         return
-    
+
     try:
         with open(CSV_PATH, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -2245,16 +2232,15 @@ async def stream_test_data(websocket: WebSocket):
         await websocket.send_json({"error": f"Failed to read CSV: {str(e)}"})
         await websocket.close()
         return
-    
+
     if not rows:
         await websocket.send_json({"error": "CSV file is empty"})
         await websocket.close()
         return
-    
+
     delay_seconds = 2.5
     try:
         for idx, row in enumerate(rows):
-            # Check if client is still connected before sending
             try:
                 processed_row = {}
                 for key, value in row.items():
@@ -2263,30 +2249,27 @@ async def stream_test_data(websocket: WebSocket):
                     except (ValueError, TypeError):
                         processed_row[key] = value
                 processed_row["_row_index"] = idx + 1
-                
                 await websocket.send_json(processed_row)
                 await asyncio.sleep(delay_seconds)
             except Exception as e:
-                # Client disconnected, exit gracefully
                 logger.info(f"WebSocket client disconnected at row {idx+1}: {e}")
                 break
-        
-        # Only send completion if client still connected
+
         try:
             await websocket.send_json({"message": "Stream complete", "total_rows": len(rows)})
             await asyncio.sleep(1)
             await websocket.close()
         except Exception:
-            pass  # Client already gone
+            pass
     except Exception as e:
         logger.warning(f"WebSocket stream error: {e}")
     finally:
-        # Ensure websocket is closed if not already
         try:
             await websocket.close()
         except Exception:
             pass
-        
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
