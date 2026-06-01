@@ -27,13 +27,14 @@ POST /trends                      → Rolling trend + correlation analysis
 """
 
 from __future__ import annotations
-import uvicorn
+from fastapi import APIRouter
 import asyncio
 import csv
 import io
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -43,10 +44,12 @@ import joblib
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from fastapi import FastAPI, File, HTTPException, UploadFile, status, WebSocket, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import File, HTTPException, UploadFile, status, WebSocket, Query
 from pydantic import BaseModel, Field, validator
 from tensorflow import keras
+from fastapi.middleware.cors import CORSMiddleware
+
+router = APIRouter()
 # ──────────────────────────────────────────────────────────────────────────────
 # Loggingapp.
 # ──────────────────────────────────────────────────────────────────────────────
@@ -71,24 +74,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Now define routes with @app
-@app.get("/ping")
-async def ping():
-    return {"status": "ok"}
-
-def _models_ready() -> bool:
-    return REQUIRED_MODEL_KEYS.issubset(models.keys())
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting up – loading models...")
-    try:
-        await load_all_models()
-        logger.info("All models loaded successfully")
-    except Exception as e:
-        logger.error(f"Model loading failed: {e}")
-        # Keep the app alive but models will be missing
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants — must match the notebook exactly
 # ──────────────────────────────────────────────────────────────────────────────
