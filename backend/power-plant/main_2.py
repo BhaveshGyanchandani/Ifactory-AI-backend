@@ -27,6 +27,7 @@ POST /trends                      → Rolling trend + correlation analysis
 """
 
 from __future__ import annotations
+import uvicorn
 import asyncio
 import csv
 import io
@@ -75,6 +76,19 @@ app.add_middleware(
 @app.get("/ping")
 async def ping():
     return {"status": "ok"}
+
+def _models_ready() -> bool:
+    return REQUIRED_MODEL_KEYS.issubset(models.keys())
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting up – loading models...")
+    try:
+        await load_all_models()
+        logger.info("All models loaded successfully")
+    except Exception as e:
+        logger.error(f"Model loading failed: {e}")
+        # Keep the app alive but models will be missing
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants — must match the notebook exactly
 # ──────────────────────────────────────────────────────────────────────────────
