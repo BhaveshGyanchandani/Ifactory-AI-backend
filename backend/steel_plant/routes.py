@@ -78,6 +78,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 warnings.filterwarnings("ignore")
+router = APIRouter()
+# ── Version — declared here so HF_MODEL_FILES f-strings resolve correctly ─────
+VERSION = "V10"
 
 # ── Optional heavy imports (graceful fallback if not installed) ───────────────
 
@@ -94,10 +97,10 @@ REQUIRED_MODEL_KEYS = {
 # point HF_HOME / HUGGINGFACE_HUB_CACHE to a persistent volume in production
 # so files survive container restarts and are never re-downloaded.
 from huggingface_hub import hf_hub_download
-router = APIRouter()
+
 HF_REPO_ID   = "ZOROD/Steel-plant-optimization"
 HF_REPO_TYPE = "model"
-VERSION="V10"
+
 # Mapping from logical key → filename on the Hub
 HF_MODEL_FILES: Dict[str, str] = {
     "scaler"         : f"scaler_{VERSION}.pkl",
@@ -222,7 +225,7 @@ logger = logging.getLogger("steel_api")
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS  (mirror V10 notebook exactly)
 # ══════════════════════════════════════════════════════════════════════════════
-VERSION = "V10"
+# VERSION already declared above (needed by HF_MODEL_FILES f-strings)
 
 CONTROLLABLE = [
     "Scrap_Charge_Weight_t", "Electrode_Power_MW", "O2_Blow_Rate_Nm3h",
@@ -392,6 +395,39 @@ _perf_cache: Dict[str, Any] = {}
 # Local cache — set MODEL_CACHE_DIR env var to a persistent volume in production
 MODEL_CACHE = Path(os.getenv("MODEL_CACHE_DIR", "/tmp/steel_plant_optimization"))
 MODEL_CACHE.mkdir(parents=True, exist_ok=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JSON SERIALISATION HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+def _jsonify(obj: Any) -> Any:
+    """
+    Recursively convert numpy / pandas scalars to native Python types so
+    FastAPI's jsonable_encoder never chokes on numpy types.
+
+    Uses np.generic + .item() for numpy 2.x compatibility — in numpy 2.x,
+    np.bool_ no longer inherits from Python bool, so isinstance(x, bool)
+    misses it. np.generic catches ALL numpy scalar types in one check.
+    """
+    if isinstance(obj, dict):
+        return {k: _jsonify(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonify(v) for v in obj]
+    # numpy scalars — .item() always returns the Python-native equivalent
+    if isinstance(obj, np.generic):
+        native = obj.item()
+        if isinstance(native, float) and math.isnan(native):
+            return None
+        return native
+    if isinstance(obj, np.ndarray):
+        return [_jsonify(v) for v in obj.tolist()]
+    # pandas Timestamp
+    if isinstance(obj, pd.Timestamp):
+        return str(obj)
+    # plain Python NaN
+    if isinstance(obj, float) and math.isnan(obj):
+        return None
+    return obj
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LSTM-AE ARCHITECTURE  (must match V10 notebook exactly)
@@ -667,6 +703,17 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     Must be called on isolated splits only (no cross-boundary leakage).
     """
     df = df.copy().reset_index(drop=True)
+
+    # ── Coerce object columns to numeric (happens when mini-DataFrames are built
+    #    from pd.concat([Series, dict]) — avoids 'float has no sin method' errors)
+    #    Use try/except instead of errors="ignore" (removed in pandas 2.0)
+    for col in df.columns:
+        if df[col].dtype == object:
+            try:
+                df[col] = df[col].astype(float)
+            except (ValueError, TypeError):
+                pass  # leave non-numeric columns (e.g. Timestamp strings) unchanged
+
     w10, w30, w60 = 2, 6, 12
 
     roll_base = {
@@ -784,13 +831,16 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     if "Bath_Carbon_Pct" in df.columns and "Slag_Basicity" in df.columns:
         df["BathC_excess_yield"] = (df["Bath_Carbon_Pct"] - 0.40).clip(lower=0).round(4)
 
-    # Fourier cyclical time features
+    # Fourier cyclical time features — cast to float first to avoid
+    # 'float object has no sin method' when dtype is object
     if "Hour_of_Day" in df.columns:
-        df["Hour_sin"] = np.sin(2 * np.pi * df["Hour_of_Day"] / 24).round(4)
-        df["Hour_cos"] = np.cos(2 * np.pi * df["Hour_of_Day"] / 24).round(4)
+        h = pd.to_numeric(df["Hour_of_Day"], errors="coerce").fillna(0).astype(float)
+        df["Hour_sin"] = np.sin(2 * np.pi * h / 24).round(4)
+        df["Hour_cos"] = np.cos(2 * np.pi * h / 24).round(4)
     if "Day_of_Week" in df.columns:
-        df["DoW_sin"] = np.sin(2 * np.pi * df["Day_of_Week"] / 7).round(4)
-        df["DoW_cos"] = np.cos(2 * np.pi * df["Day_of_Week"] / 7).round(4)
+        d = pd.to_numeric(df["Day_of_Week"], errors="coerce").fillna(0).astype(float)
+        df["DoW_sin"] = np.sin(2 * np.pi * d / 7).round(4)
+        df["DoW_cos"] = np.cos(2 * np.pi * d / 7).round(4)
 
     return df
 
@@ -866,14 +916,14 @@ def _check_constraints(kpis: Dict[str, Dict]) -> Tuple[bool, Dict[str, float]]:
     tc = kpis.get("Tap_Carbon_Pct", {}).get("point", 0)
 
     violations = {
-        "Energy_too_high"    : max(0.0, e  - CONSTRAINTS["ENERGY_HARD_MAX"]),
-        "Production_too_low" : max(0.0, CONSTRAINTS["PRODUCTION_MIN_TPH"] - pr),
-        "Production_too_high": max(0.0, pr - CONSTRAINTS["PRODUCTION_MAX_TPH"]),
-        "Yield_too_low"      : max(0.0, CONSTRAINTS["STEEL_YIELD_MIN"] - sy),
-        "Carbon_too_low"     : max(0.0, CONSTRAINTS["TAP_CARBON_MIN"]  - tc),
-        "Carbon_too_high"    : max(0.0, tc - CONSTRAINTS["TAP_CARBON_MAX"]),
+        "Energy_too_high"    : float(max(0.0, e  - CONSTRAINTS["ENERGY_HARD_MAX"])),
+        "Production_too_low" : float(max(0.0, CONSTRAINTS["PRODUCTION_MIN_TPH"] - pr)),
+        "Production_too_high": float(max(0.0, pr - CONSTRAINTS["PRODUCTION_MAX_TPH"])),
+        "Yield_too_low"      : float(max(0.0, CONSTRAINTS["STEEL_YIELD_MIN"] - sy)),
+        "Carbon_too_low"     : float(max(0.0, CONSTRAINTS["TAP_CARBON_MIN"]  - tc)),
+        "Carbon_too_high"    : float(max(0.0, tc - CONSTRAINTS["TAP_CARBON_MAX"])),
     }
-    feasible = all(v == 0.0 for v in violations.values())
+    feasible = bool(all(v == 0.0 for v in violations.values()))
     return feasible, violations
 
 
@@ -951,10 +1001,10 @@ def _anomaly_score_for_df(df: pd.DataFrame) -> Dict[str, Any]:
     flag  = norm > _anomaly_threshold
 
     return {
-        "iso_score"      : round(norm, 4),
-        "lstm_score"     : 0.0,           # updated below if AE available
-        "combined_score" : round(norm, 4),
-        "flag"           : flag,
+        "iso_score"      : round(float(norm), 4),
+        "lstm_score"     : 0.0,
+        "combined_score" : round(float(norm), 4),
+        "flag"           : bool(flag),
         "alert_level"    : ("CRITICAL" if norm > 0.8 else
                             "HIGH"     if norm > 0.6 else
                             "ELEVATED" if norm > 0.4 else "NORMAL"),
@@ -1074,7 +1124,7 @@ def _format_recommendation(
             "delta"             : round(delta, 4),
             "change_pct"        : round(pct, 2),
             "within_roc_cap"    : within_roc,
-            "unit"              : BOUNDS.get(var, (0, 0)).__class__.__name__,
+            "unit"              : "",
         })
 
     return {
@@ -1610,47 +1660,19 @@ def _df_predict_all(df: pd.DataFrame) -> List[Dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# FASTAPI APP
-# ══════════════════════════════════════════════════════════════════════════════
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("🚀 Steel Plant API starting up — loading V10 models …")
-    await load_all_models()
-    logger.info("✅ Ready to serve requests.")
-    yield
-    logger.info("👋 Shutting down.")
-
-
-app = FastAPI(
-    title="Steel Plant Energy Optimisation API",
-    description=(
-        "End-to-end AI advisory system for the EAF→LF→CC→HRM route.\n\n"
-        "Surrogate: LGB + XGB + CatBoost + Ridge ensemble\n"
-        "Anomaly: LSTM-AE (3-seed) + IsolationForest\n"
-        "Optimiser: Optuna TPE → CMA-ES\n"
-        "Explainability: SHAP TreeExplainer\n"
-    ),
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # ── CORE ENDPOINTS ────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/ping", tags=["core"])
+async def ping():
+    """Lightweight liveness probe — no model required."""
+    return _jsonify({"status": "ok", "service": "steel_plant", "models_loaded": _models_ready()})
+
 
 @router.get("/health", tags=["core"])
 async def health():
     """Service status + model load summary."""
-    return {
+    return _jsonify({
         "status"         : "ok" if _models_ready() else "loading",
         "version"        : VERSION,
         "models_loaded"  : {
@@ -1669,7 +1691,7 @@ async def health():
         "constraints"    : CONSTRAINTS,
         "torch_device"   : str(DEVICE) if DEVICE else "unavailable",
         "weights_dir"    : str(WEIGHTS_DIR),
-    }
+    })
 
 
 @router.get("/models/info", tags=["core"])
@@ -1697,12 +1719,12 @@ async def models_info():
     for name in ["xgb", "meta"]:
         info[name] = {tgt: "loaded" for tgt in models.get(name, {})}
     info["backtest_performance"] = _perf_cache.get("backtest", {})
-    return info
+    return _jsonify(info)
 
 
 @router.get("/threshold/anomaly", tags=["core"])
 async def get_threshold():
-    return {"threshold": _anomaly_threshold, "description": "Combined anomaly score threshold (0–1)"}
+    return _jsonify({"threshold": _anomaly_threshold, "description": "Combined anomaly score threshold (0–1)"})
 
 
 @router.put("/threshold/anomaly", tags=["core"])
@@ -1711,7 +1733,7 @@ async def set_threshold(body: ThresholdUpdate):
     async with _threshold_lock:
         old = _anomaly_threshold
         _anomaly_threshold = body.threshold
-    return {"old_threshold": old, "new_threshold": _anomaly_threshold}
+    return _jsonify({"old_threshold": old, "new_threshold": _anomaly_threshold})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1759,7 +1781,7 @@ async def predict(body: PredictRequest):
         })
 
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "version"          : VERSION,
         "inference_time_ms": round(elapsed, 2),
         "windows_scored"   : len(predictions),
@@ -1771,7 +1793,7 @@ async def predict(body: PredictRequest):
             "anomaly_windows"   : sum(1 for p in predictions if p["anomaly"]["flag"]),
         },
         "predictions"      : predictions,
-    }
+    })
 
 
 @router.post("/predict/csv", tags=["prediction"])
@@ -1855,7 +1877,7 @@ async def predict_csv(
         })
 
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "filename"         : file.filename,
         "rows_in"          : len(df_raw),
         "windows_returned" : len(predictions),
@@ -1868,7 +1890,7 @@ async def predict_csv(
             "mean_energy_kWh_t" : round(float(np.mean([p["kpi_predictions"][TARGET_ENERGY]["point"] for p in predictions])), 2) if predictions else 0,
         },
         "predictions"      : predictions,
-    }
+    })
 
 
 @router.post("/predict/enriched", tags=["prediction"])
@@ -1907,7 +1929,7 @@ async def predict_enriched(body: PredictRequest):
         charts["rca_waterfall"]   = _chart_rca_waterfall(rca_result)
 
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "version"            : VERSION,
         "inference_time_ms"  : round(elapsed, 2),
         "predictions"        : pred_resp["predictions"],
@@ -1916,7 +1938,7 @@ async def predict_enriched(body: PredictRequest):
         "optimization"       : opt_result,
         "anomaly"            : anomaly,
         "charts_base64"      : charts,
-    }
+    })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1942,14 +1964,14 @@ async def optimize(body: OptimizeRequest):
         OPTUNA_TRIALS_TPE_FULL, OPTUNA_TRIALS_CMA_FULL, body.top_k,
     )
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "version"               : VERSION,
         "optimization_time_ms"  : round(elapsed, 2),
         "n_recommendations"     : len(recs),
         "trials_run"            : OPTUNA_TRIALS_TPE_FULL + OPTUNA_TRIALS_CMA_FULL,
         "recommendations"       : recs,
         "roc_cap_pct"           : CONSTRAINTS["ROC_MAX_PCT"] * 100,
-    }
+    })
 
 
 @router.post("/optimize/quick", tags=["optimization"])
@@ -1970,13 +1992,13 @@ async def optimize_quick(body: OptimizeRequest):
         OPTUNA_TRIALS_TPE_QUICK, OPTUNA_TRIALS_CMA_QUICK, min(body.top_k, 3),
     )
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "version"            : VERSION,
         "optimization_time_ms": round(elapsed, 2),
         "mode"               : "quick",
         "n_recommendations"  : len(recs),
         "recommendations"    : recs,
-    }
+    })
 
 
 @router.post("/simulate", tags=["optimization"])
@@ -2036,7 +2058,7 @@ async def simulate(body: SimulateRequest):
     feasible_sim,  viols_sim  = _check_constraints(sim_kpis)
     elapsed = (time.perf_counter() - t0) * 1000
 
-    return {
+    return _jsonify({
         "version"            : VERSION,
         "simulation_time_ms" : round(elapsed, 2),
         "setpoint_overrides" : clean_sp,
@@ -2045,7 +2067,7 @@ async def simulate(body: SimulateRequest):
         "simulated"          : {"kpis": sim_kpis,      "feasible": feasible_sim, "violations": viols_sim},
         "kpi_deltas"         : deltas,
         "energy_saving_kWh_t": round(baseline_kpis[TARGET_ENERGY]["point"] - sim_kpis.get(TARGET_ENERGY, baseline_kpis[TARGET_ENERGY])["point"], 3),
-    }
+    })
 
 
 @router.post("/predict/csv/optimized", tags=["optimization"])
@@ -2110,7 +2132,7 @@ async def predict_csv_optimized(
         })
 
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "filename"          : file.filename,
         "rows_in"           : len(df_raw),
         "windows_optimized" : len(results),
@@ -2120,7 +2142,7 @@ async def predict_csv_optimized(
             "avg_best_saving_kWh_t": round(float(np.mean([r["best_saving_kWh_t"] for r in results])), 3),
             "windows_with_saving"  : sum(1 for r in results if r["best_saving_kWh_t"] > 0),
         },
-    }
+    })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2148,7 +2170,7 @@ async def rca(body: RCARequest):
         result["chart_base64"] = _chart_rca_waterfall(result)
 
     result["rca_time_ms"] = round((time.perf_counter() - t0) * 1000, 2)
-    return result
+    return _jsonify(result)
 
 
 @router.post("/shap/explain", tags=["analysis"])
@@ -2190,11 +2212,11 @@ async def shap_explain(body: PredictRequest):
             shap_results[tgt] = {"error": str(exc)}
 
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "shap_explanations": shap_results,
         "shap_time_ms"     : round(elapsed, 2),
         "feature_count"    : len(feat),
-    }
+    })
 
 
 @router.post("/anomaly/detect", tags=["analysis"])
@@ -2211,7 +2233,7 @@ async def anomaly_detect(body: PredictRequest):
     iso_m    = models.get("iso_forest")
 
     if not iso_m or not iso_cols or not iso_sc:
-        return {"error": "IsolationForest not loaded.", "anomaly_results": []}
+        return _jsonify({"error": "IsolationForest not loaded.", "anomaly_results": []})
 
     available = [c for c in iso_cols if c in df.columns]
     X    = df[available].ffill().bfill().values
@@ -2234,7 +2256,7 @@ async def anomaly_detect(body: PredictRequest):
 
     elapsed = (time.perf_counter() - t0) * 1000
     anomalous = [r for r in results if r["flag"]]
-    return {
+    return _jsonify({
         "threshold"     : _anomaly_threshold,
         "total_windows" : len(results),
         "anomaly_count" : len(anomalous),
@@ -2242,7 +2264,7 @@ async def anomaly_detect(body: PredictRequest):
         "anomaly_results": results,
         "anomalous_windows": anomalous,
         "inference_time_ms": round(elapsed, 2),
-    }
+    })
 
 
 @router.post("/energy/analysis", tags=["analysis"])
@@ -2282,7 +2304,7 @@ async def energy_analysis(body: PredictRequest):
     opt_potential    = max(0, e_pred["point"] - 370)   # 370 = theoretical minimum
 
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "version"              : VERSION,
         "predicted_energy"     : e_pred,
         "energy_components_kWh_t": {
@@ -2302,7 +2324,7 @@ async def energy_analysis(body: PredictRequest):
         "optimisation_potential_kWh_t": round(opt_potential, 2),
         "estimated_cost_saving_per_heat_usd": round(opt_potential * scrap * 0.035, 2),
         "analysis_time_ms"     : round(elapsed, 2),
-    }
+    })
 
 
 @router.post("/trends", tags=["analysis"])
@@ -2336,13 +2358,13 @@ async def trends(body: PredictRequest):
             corr_with_energy[col] = round(c, 4) if not math.isnan(c) else 0.0
 
     elapsed = (time.perf_counter() - t0) * 1000
-    return {
+    return _jsonify({
         "sensor_trends"         : trend_results,
         "correlation_with_energy": corr_with_energy,
         "top_correlated"        : sorted(corr_with_energy.items(), key=lambda x: abs(x[1]), reverse=True)[:5],
         "window_size"           : len(df),
         "analysis_time_ms"      : round(elapsed, 2),
-    }
+    })
 
 
 @router.post("/sensors/health-check", tags=["analysis"])
@@ -2378,7 +2400,7 @@ async def sensors_health_check(body: PredictRequest):
     warning   = [s for s in sensor_status if s["status"] == "WARNING"]
     health_sc = _compute_health_score(sensor_status)
 
-    return {
+    return _jsonify({
         "overall_health_score": health_sc,
         "health_label"        : "CRITICAL" if health_sc < 40 else "POOR" if health_sc < 65 else "FAIR" if health_sc < 80 else "GOOD",
         "total_sensors"       : len(sensor_status),
@@ -2387,7 +2409,7 @@ async def sensors_health_check(body: PredictRequest):
         "sensor_status"       : sensor_status,
         "critical_sensors"    : critical,
         "priority_actions"    : [s["action"] for s in (critical + warning)[:3] if s["action"]],
-    }
+    })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2400,12 +2422,12 @@ async def chart_backtest():
     path = PLOTS_DIR / f"01_backtest_{VERSION}.png"
     if path.exists():
         data = path.read_bytes()
-        return {"chart_base64": base64.b64encode(data).decode("utf-8"),
-                "source": "pre-computed", "file": str(path)}
+        return _jsonify({"chart_base64": base64.b64encode(data).decode("utf-8"),
+                "source": "pre-computed", "file": str(path)})
     if MPL_AVAILABLE:
         chart = _chart_model_performance()
-        return {"chart_base64": chart, "source": "generated"}
-    return {"chart_base64": None, "error": "No backtest chart available."}
+        return _jsonify({"chart_base64": chart, "source": "generated"})
+    return _jsonify({"chart_base64": None, "error": "No backtest chart available."})
 
 
 @router.get("/charts/shap", tags=["charts"])
@@ -2414,16 +2436,16 @@ async def chart_shap():
     path = PLOTS_DIR / f"02_shap_beeswarm_{VERSION}.png"
     if path.exists():
         data = path.read_bytes()
-        return {"chart_base64": base64.b64encode(data).decode("utf-8"),
-                "source": "pre-computed"}
-    return {"chart_base64": None, "error": "SHAP chart not found. Run the V10 notebook first."}
+        return _jsonify({"chart_base64": base64.b64encode(data).decode("utf-8"),
+                "source": "pre-computed"})
+    return _jsonify({"chart_base64": None, "error": "SHAP chart not found. Run the V10 notebook first."})
 
 
 @router.get("/charts/model-performance", tags=["charts"])
 async def chart_model_performance():
     """Generate model performance chart from backtest CSV."""
     chart = _chart_model_performance() if MPL_AVAILABLE else None
-    return {"chart_base64": chart, "source": "generated"}
+    return _jsonify({"chart_base64": chart, "source": "generated"})
 
 
 @router.post("/charts/live", tags=["charts"])
@@ -2433,7 +2455,7 @@ async def chart_live(body: ChartRequest):
     df = _readings_to_df(body.readings)
     recs = await predict(PredictRequest(readings=body.readings))
     chart = _chart_energy_timeline(df, recs["predictions"]) if MPL_AVAILABLE else None
-    return {"chart_base64": chart, "windows": len(recs["predictions"])}
+    return _jsonify({"chart_base64": chart, "windows": len(recs["predictions"])})
 
 
 @router.post("/charts/sensor-trends", tags=["charts"])
@@ -2442,7 +2464,7 @@ async def chart_sensor_trends(body: ChartRequest):
     df = _readings_to_df(body.readings)
     sensors = body.sensors or CONTROLLABLE[:6]
     chart   = _chart_sensor_trends(df, sensors) if MPL_AVAILABLE else None
-    return {"chart_base64": chart, "sensors_plotted": sensors}
+    return _jsonify({"chart_base64": chart, "sensors_plotted": sensors})
 
 
 @router.post("/charts/pareto", tags=["charts"])
@@ -2455,11 +2477,11 @@ async def chart_pareto(body: OptimizeRequest):
     opt_df = pd.concat([_readings_to_df(body.context), df], ignore_index=True) if body.context else df
     recs   = await asyncio.to_thread(_run_optimisation, opt_df, 50, 100, body.top_k)
     chart  = _chart_pareto(recs) if MPL_AVAILABLE else None
-    return {
+    return _jsonify({
         "chart_base64"     : chart,
         "n_recommendations": len(recs),
         "recommendations"  : recs,
-    }
+    })
 
 
 @router.post("/charts/rca", tags=["charts"])
@@ -2471,7 +2493,7 @@ async def chart_rca(body: RCARequest):
     full = pd.concat([ctx, df], ignore_index=True) if ctx is not None else df
     rca_result = await asyncio.to_thread(_run_rca, full, body.target)
     chart = _chart_rca_waterfall(rca_result) if MPL_AVAILABLE else None
-    return {"chart_base64": chart, "rca": rca_result}
+    return _jsonify({"chart_base64": chart, "rca": rca_result})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2484,7 +2506,7 @@ async def dashboard():
     Combined dashboard payload for the client frontend.
     Returns: model status, backtest performance, constraint specs, normal ranges.
     """
-    return {
+    return _jsonify({
         "version"         : VERSION,
         "api_status"      : "ready" if _models_ready() else "loading",
         "models"          : {
@@ -2502,14 +2524,14 @@ async def dashboard():
         "conformal_adjustments": models.get("conformal", {}),
         "anomaly_threshold": _anomaly_threshold,
         "features_loaded" : len(models.get("feature_cols", [])),
-    }
+    })
 
 
 @router.get("/dashboard/performance", tags=["dashboard"])
 async def dashboard_performance():
     """Model performance KPI card data for the frontend."""
     bt = _perf_cache.get("backtest", {})
-    return {
+    return _jsonify({
         "surrogate_performance" : {
             "note": "Run V10 notebook to populate. Metrics loaded from backtest CSV.",
             **bt,
@@ -2525,7 +2547,7 @@ async def dashboard_performance():
             "conformal"          : bool(models.get("conformal")),
         },
         "version": VERSION,
-    }
+    })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2549,7 +2571,7 @@ async def stream_live_data(websocket: WebSocket):
     logger.info("WebSocket client connected.")
 
     if not _models_ready():
-        await websocket.send_json({"type": "error", "message": "Models not loaded."})
+        await websocket.send_json(_jsonify({"type": "error", "message": "Models not loaded."}))
         await websocket.close()
         return
 
@@ -2622,7 +2644,7 @@ async def stream_live_data(websocket: WebSocket):
                     "violations"     : {k: round(v, 3) for k, v in viols.items() if v > 0},
                     "anomaly"        : anom,
                 }
-                await websocket.send_json(payload)
+                await websocket.send_json(_jsonify(payload))
 
                 # Send alert if anomaly detected
                 if anom["flag"]:
@@ -2635,24 +2657,24 @@ async def stream_live_data(websocket: WebSocket):
                         "message"    : f"Anomaly detected at row {i} — score={anom['combined_score']:.3f}",
                         "top_deviations": [],
                     }
-                    await websocket.send_json(alert_payload)
+                    await websocket.send_json(_jsonify(alert_payload))
 
             except Exception as exc:
                 logger.warning("Row %d inference error: %s", i, exc)
 
             await asyncio.sleep(2.0)  # 2-second interval simulates 5-min real plant cycle
 
-        await websocket.send_json({
+        await websocket.send_json(_jsonify({
             "type"      : "complete",
             "message"   : "Stream finished.",
             "total_rows": total,
-        })
+        }))
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected.")
     except Exception as exc:
         logger.error("WebSocket error: %s", exc)
         try:
-            await websocket.send_json({"type": "error", "message": str(exc)})
+            await websocket.send_json(_jsonify({"type": "error", "message": str(exc)}))
         except Exception:
             pass
     finally:
@@ -2662,13 +2684,14 @@ async def stream_live_data(websocket: WebSocket):
             pass
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8002))
     uvicorn.run(
-        "main_2:app",
+        "main:app",
         host    = "0.0.0.0",
         port    = port,
         reload  = False,
