@@ -116,4 +116,5 @@ app.add_middleware(
 def ping():
     return {"status": "ok", "message": "pong"}
 
-app.include_router(steel_router, prefix="/steel")
+app.include_router(power_router, prefix="/power")
+# app.include_router(steel_router, prefix="/steel")
